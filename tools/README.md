@@ -20,6 +20,31 @@ cargo install tquic_tools
 - [Chinese version](https://tquic.net/zh/docs/getting_started/demo/)
 
 
+## Multipath bonding setup
+
+To bond multiple WANs with redundant scheduling, run both server and client
+with `--bond`. This enables multipath and forces the redundant scheduler.
+
+Server (bind each WAN address):
+
+```
+tquic_server --bond --listen <SERVER_WAN1:PORT> --listen-addrs <SERVER_WAN2:PORT>,<SERVER_WAN3:PORT>
+```
+
+Client (bind each local WAN and optionally map to server WANs):
+
+```
+tquic_client --bond --local-addresses <CLIENT_WAN1_IP>,<CLIENT_WAN2_IP> \
+  --remote-addresses <SERVER_WAN2:PORT> <URL>
+```
+
+Notes:
+- `--remote-addresses` can be omitted to reuse the primary server address for
+  all additional paths, or it can provide one address per additional local
+  address.
+- For custom scheduling, use `--enable-multipath` with
+  `--multipath-algor MINRTT|REDUNDANT|ROUNDROBIN` instead of `--bond`.
+
 ## License
 
 The project is under the Apache 2.0 license.

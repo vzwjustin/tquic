@@ -86,6 +86,14 @@ pub struct ClientOpt {
     #[clap(long, value_delimiter = ',', value_name = "ADDR")]
     pub local_addresses: Vec<IpAddr>,
 
+    /// Optional remote addresses for additional paths.
+    #[clap(long, value_delimiter = ',', value_name = "ADDR", help_heading = "Protocol")]
+    pub remote_addresses: Vec<SocketAddr>,
+
+    /// Enable true packet bonding (multipath with redundant scheduler).
+    #[clap(long, help_heading = "Protocol")]
+    pub bond: bool,
+
     /// Request URLs. The host of the first url is used as TLS SNI.
     #[clap(value_delimiter = ' ')]
     pub urls: Vec<Url>,
@@ -611,9 +619,10 @@ impl Worker {
         }
         let sock = Rc::new(sock);
 
+        let extra_paths = build_extra_paths(&option, &assigned_addrs)?;
         let handlers = WorkerHandler::new(
             &option,
-            &assigned_addrs,
+            extra_paths,
             worker_ctx.clone(),
             senders.clone(),
         );
@@ -1313,6 +1322,51 @@ impl RequestSender {
     }
 }
 
+fn build_extra_paths(
+    option: &ClientOpt,
+    local_addresses: &[SocketAddr],
+) -> Result<Vec<(SocketAddr, SocketAddr)>> {
+    let extra_locals = match local_addresses.get(1..) {
+        Some(addrs) => addrs,
+        None => return Ok(Vec::new()),
+    };
+    if extra_locals.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if option.remote_addresses.is_empty() {
+        let remote = option
+            .connect_to
+            .ok_or_else(|| "missing connect address".to_string())?;
+        return Ok(extra_locals
+            .iter()
+            .map(|local| (*local, remote))
+            .collect());
+    }
+
+    if option.remote_addresses.len() == 1 {
+        let remote = option.remote_addresses[0];
+        return Ok(extra_locals
+            .iter()
+            .map(|local| (*local, remote))
+            .collect());
+    }
+
+    if option.remote_addresses.len() == extra_locals.len() {
+        return Ok(extra_locals
+            .iter()
+            .zip(option.remote_addresses.iter())
+            .map(|(local, remote)| (*local, *remote))
+            .collect());
+    }
+
+    Err(format!(
+        "remote-addresses must be empty, a single address, or match additional local addresses ({}).",
+        extra_locals.len()
+    )
+    .into())
+}
+
 struct WorkerHandler {
     /// Worker option.
     option: ClientOpt,
@@ -1323,17 +1377,14 @@ struct WorkerHandler {
     /// Mapping connection index to request sender.
     senders: Rc<RefCell<FxHashMap<u64, RequestSender>>>,
 
-    /// Remote server.
-    remote: SocketAddr,
-
-    /// Local address list
-    local_addresses: Vec<SocketAddr>,
+    /// Additional paths to add after handshake.
+    extra_paths: Vec<(SocketAddr, SocketAddr)>,
 }
 
 impl WorkerHandler {
     fn new(
         option: &ClientOpt,
-        local_addresses: &[SocketAddr],
+        extra_paths: Vec<(SocketAddr, SocketAddr)>,
         worker_ctx: Rc<RefCell<WorkerContext>>,
         senders: Rc<RefCell<FxHashMap<u64, RequestSender>>>,
     ) -> Self {
@@ -1341,8 +1392,7 @@ impl WorkerHandler {
             option: option.clone(),
             worker_ctx,
             senders,
-            remote: option.connect_to.unwrap(),
-            local_addresses: local_addresses.to_owned(),
+            extra_paths,
         }
     }
 
@@ -1444,23 +1494,21 @@ impl TransportHandler for WorkerHandler {
         }
 
         // Try to add additional paths
-        if let Some(addrs) = self.local_addresses.get(1..) {
-            for local in addrs {
-                match conn.add_path(*local, self.remote) {
-                    Ok(_) => debug!(
-                        "{} add new path {}-{}",
-                        conn.trace_id(),
-                        *local,
-                        self.remote
-                    ),
-                    Err(e) => debug!(
-                        "{} fail to add path {}-{}: {}",
-                        conn.trace_id(),
-                        *local,
-                        self.remote,
-                        e
-                    ),
-                }
+        for (local, remote) in &self.extra_paths {
+            match conn.add_path(*local, *remote) {
+                Ok(_) => debug!(
+                    "{} add new path {}-{}",
+                    conn.trace_id(),
+                    *local,
+                    *remote
+                ),
+                Err(e) => debug!(
+                    "{} fail to add path {}-{}: {}",
+                    conn.trace_id(),
+                    *local,
+                    *remote,
+                    e
+                ),
             }
         }
 
@@ -1556,6 +1604,70 @@ fn process_connect_address(option: &mut ClientOpt) {
     }
 }
 
+fn validate_path_options(option: &ClientOpt) -> std::result::Result<(), clap::error::Error> {
+    if option.remote_addresses.is_empty() {
+        return Ok(());
+    }
+
+    let extra_local_count = option.local_addresses.len().saturating_sub(1);
+    if extra_local_count == 0 {
+        return Err(ClientOpt::command().error(
+            ErrorKind::InvalidValue,
+            "remote-addresses requires at least two local addresses",
+        ));
+    }
+
+    if option.remote_addresses.len() != 1 && option.remote_addresses.len() != extra_local_count {
+        return Err(ClientOpt::command().error(
+            ErrorKind::InvalidValue,
+            format!(
+                "remote-addresses must have 1 entry or match additional local addresses ({})",
+                extra_local_count
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+fn apply_bonding(option: &mut ClientOpt) {
+    if !option.bond {
+        return;
+    }
+
+    option.enable_multipath = true;
+    if option.multipath_algor != MultipathAlgorithm::Redundant {
+        warn!("bonding enabled; forcing multipath algorithm to REDUNDANT");
+        option.multipath_algor = MultipathAlgorithm::Redundant;
+    }
+}
+
+fn warn_multipath_setup(option: &mut ClientOpt) {
+    if !option.enable_multipath {
+        return;
+    }
+
+    let total_paths = std::cmp::max(1, option.local_addresses.len()) as u64;
+    if option.local_addresses.len() < 2 {
+        warn!("multipath enabled but only one local address is configured");
+    }
+
+    if option.active_cid_limit < total_paths {
+        if option.bond {
+            warn!(
+                "bonding requires active_cid_limit >= {}; adjusting from {}",
+                total_paths, option.active_cid_limit
+            );
+            option.active_cid_limit = total_paths;
+        } else {
+            warn!(
+                "active_cid_limit {} may be too low for {} paths",
+                option.active_cid_limit, total_paths
+            );
+        }
+    }
+}
+
 fn parse_option() -> std::result::Result<ClientOpt, clap::error::Error> {
     let mut option = ClientOpt::parse();
 
@@ -1565,6 +1677,8 @@ fn parse_option() -> std::result::Result<ClientOpt, clap::error::Error> {
             "Specify at least one request URL",
         ));
     }
+
+    validate_path_options(&option)?;
 
     if option.max_requests_per_conn != 0 {
         option.max_requests_per_conn = max(option.max_requests_per_conn, option.urls.len() as u64);
@@ -1600,6 +1714,8 @@ fn process_option(option: &mut ClientOpt) -> Result<()> {
     }
 
     process_connect_address(option);
+    apply_bonding(option);
+    warn_multipath_setup(option);
     Ok(())
 }
 
