@@ -48,6 +48,7 @@ use tquic::TlsConfig;
 use tquic::TransportHandler;
 use tquic_tools::ApplicationProto;
 use tquic_tools::CertCompressionAlgorithmArg;
+use tquic_tools::discover_global_ip_addrs;
 use tquic_tools::QuicSocket;
 use tquic_tools::Result;
 
@@ -61,6 +62,10 @@ pub struct ServerOpt {
     /// Address to listen.
     #[clap(short, long, default_value = "0.0.0.0:4433", value_name = "ADDR")]
     pub listen: SocketAddr,
+
+    /// Additional addresses to listen on.
+    #[clap(long, value_delimiter = ',', value_name = "ADDR")]
+    pub listen_addrs: Vec<SocketAddr>,
 
     /// TLS certificate in PEM format.
     #[clap(
@@ -134,6 +139,10 @@ pub struct ServerOpt {
     /// Multipath scheduling algorithm
     #[clap(short, long, default_value = "MINRTT", help_heading = "Protocol")]
     pub multipath_algor: MultipathAlgorithm,
+
+    /// Enable true packet bonding (multipath with redundant scheduler).
+    #[clap(long, help_heading = "Protocol")]
+    pub bond: bool,
 
     /// Set active_connection_id_limit transport parameter. Values lower than 2 will be ignored.
     #[clap(
@@ -274,6 +283,9 @@ struct Server {
 
     /// Packet read buffer
     recv_buf: Vec<u8>,
+
+    /// Bound listen addresses.
+    bound_addrs: Vec<SocketAddr>,
 }
 
 impl Server {
@@ -343,13 +355,23 @@ impl Server {
         let registry = poll.registry();
 
         let handlers = ServerHandler::new(option)?;
-        let sock = Rc::new(QuicSocket::new(&option.listen, registry)?);
+        let mut sock = QuicSocket::new(&option.listen, registry)?;
+        let mut bound_addrs = vec![sock.local_addr()];
+        for addr in &option.listen_addrs {
+            if bound_addrs.contains(addr) {
+                continue;
+            }
+            let bound = sock.add(addr, registry)?;
+            bound_addrs.push(bound);
+        }
+        let sock = Rc::new(sock);
 
         Ok(Server {
             endpoint: Endpoint::new(Box::new(config), true, Box::new(handlers), sock.clone()),
             poll,
             sock,
             recv_buf: vec![0u8; MAX_BUF_SIZE],
+            bound_addrs,
         })
     }
 
@@ -398,6 +420,82 @@ fn convert_address_token_key(key: &str) -> [u8; 16] {
     let mut token_key = [0_u8; 16];
     token_key.copy_from_slice(&key_data[..]);
     token_key
+}
+
+fn normalize_listen_addrs(option: &mut ServerOpt) {
+    option.listen_addrs.retain(|addr| *addr != option.listen);
+    option.listen_addrs.sort();
+    option.listen_addrs.dedup();
+
+    if option.listen.ip().is_unspecified() && !option.listen_addrs.is_empty() {
+        option.listen = option.listen_addrs.remove(0);
+    }
+}
+
+fn maybe_populate_listen_addrs(option: &mut ServerOpt) -> Result<()> {
+    if !option.bond || !option.listen_addrs.is_empty() || !option.listen.ip().is_unspecified() {
+        return Ok(());
+    }
+
+    let port = option.listen.port();
+    let family_ipv4 = option.listen.is_ipv4();
+    let mut addresses: Vec<SocketAddr> = discover_global_ip_addrs()?
+        .into_iter()
+        .filter(|addr| addr.is_ipv4() == family_ipv4)
+        .map(|addr| SocketAddr::new(addr, port))
+        .collect();
+    addresses.sort();
+    addresses.dedup();
+
+    if addresses.is_empty() {
+        warn!(
+            "bonding enabled but no usable {} addresses discovered; using wildcard listen",
+            if family_ipv4 { "IPv4" } else { "IPv6" }
+        );
+        return Ok(());
+    }
+
+    option.listen = addresses[0];
+    option.listen_addrs = addresses[1..].to_vec();
+    Ok(())
+}
+
+fn apply_bonding(option: &mut ServerOpt) {
+    if !option.bond {
+        return;
+    }
+
+    option.enable_multipath = true;
+    if option.multipath_algor != MultipathAlgorithm::Redundant {
+        warn!("bonding enabled; forcing multipath algorithm to REDUNDANT");
+        option.multipath_algor = MultipathAlgorithm::Redundant;
+    }
+}
+
+fn warn_multipath_setup(option: &mut ServerOpt) {
+    if !option.enable_multipath {
+        return;
+    }
+
+    if option.listen.ip().is_unspecified() && option.listen_addrs.is_empty() {
+        warn!("multipath enabled with wildcard listen address; use --listen-addrs to bind WAN addresses");
+    }
+
+    let expected_paths = (option.listen_addrs.len() + 1) as u64;
+    if option.active_cid_limit < expected_paths {
+        if option.bond {
+            warn!(
+                "bonding requires active_cid_limit >= {}; adjusting from {}",
+                expected_paths, option.active_cid_limit
+            );
+            option.active_cid_limit = expected_paths;
+        } else {
+            warn!(
+                "active_cid_limit {} may be too low for {} listen addresses",
+                option.active_cid_limit, expected_paths
+            );
+        }
+    }
 }
 
 struct Response {
@@ -1109,6 +1207,11 @@ fn process_option(option: &mut ServerOpt) -> Result<()> {
             return Err(Box::new(e));
         }
     }
+
+    apply_bonding(option);
+    maybe_populate_listen_addrs(option)?;
+    normalize_listen_addrs(option);
+    warn_multipath_setup(option);
     Ok(())
 }
 
@@ -1124,7 +1227,7 @@ fn main() -> Result<()> {
     info!(
         "{} listen on {:?}",
         server.endpoint.trace_id(),
-        option.listen
+        server.bound_addrs
     );
     let mut events = mio::Events::with_capacity(1024);
     loop {
