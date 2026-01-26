@@ -13,11 +13,14 @@
 // limitations under the License.
 
 use std::io::ErrorKind;
+use std::net::IpAddr;
 use std::net::SocketAddr;
 
 use clap::builder::PossibleValue;
 use clap::ValueEnum;
 use env_logger::Target;
+use get_if_addrs::get_if_addrs;
+use get_if_addrs::IfAddr;
 use log::*;
 use mio::net::UdpSocket;
 use mio::Interest;
@@ -31,6 +34,42 @@ use tquic::PacketInfo;
 use tquic::PacketSendHandler;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+fn is_usable_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(addr) => {
+            !(addr.is_loopback()
+                || addr.is_link_local()
+                || addr.is_multicast()
+                || addr.is_unspecified()
+                || addr.is_broadcast())
+        }
+        IpAddr::V6(addr) => {
+            !(addr.is_loopback()
+                || addr.is_unicast_link_local()
+                || addr.is_multicast()
+                || addr.is_unspecified())
+        }
+    }
+}
+
+/// Discover non-loopback, non-link-local IP addresses on the host.
+pub fn discover_global_ip_addrs() -> Result<Vec<IpAddr>> {
+    let mut addrs = Vec::new();
+    for iface in get_if_addrs()? {
+        let ip = match iface.addr {
+            IfAddr::V4(addr) => IpAddr::V4(addr.ip),
+            IfAddr::V6(addr) => IpAddr::V6(addr.ip),
+        };
+        if is_usable_ip(ip) {
+            addrs.push(ip);
+        }
+    }
+
+    addrs.sort();
+    addrs.dedup();
+    Ok(addrs)
+}
 
 /// Certificate compression algorithm for clap parsing
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]

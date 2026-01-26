@@ -25,18 +25,16 @@ cargo install tquic_tools
 To bond multiple WANs with redundant scheduling, run both server and client
 with `--bond`. This enables multipath and forces the redundant scheduler.
 
-Server (bind each WAN address):
+Server:
+- `tquic_server --bond` binds all usable local IPs on the listen port when
+  `--listen` is a wildcard address and `--listen-addrs` is not provided.
+- To pin server addresses, pass `--listen` and `--listen-addrs`.
 
-```
-tquic_server --bond --listen <SERVER_WAN1:PORT> --listen-addrs <SERVER_WAN2:PORT>,<SERVER_WAN3:PORT>
-```
-
-Client (bind each local WAN and optionally map to server WANs):
-
-```
-tquic_client --bond --local-addresses <CLIENT_WAN1_IP>,<CLIENT_WAN2_IP> \
-  --remote-addresses <SERVER_WAN2:PORT> <URL>
-```
+Client:
+- `tquic_client --bond` auto-selects usable local IPs that match the resolved
+  server address family when `--local-addresses` is not provided.
+- Provide your real server URL as the final argument. To pin client paths, pass
+  `--local-addresses` and optionally `--remote-addresses`.
 
 Notes:
 - `--remote-addresses` can be omitted to reuse the primary server address for

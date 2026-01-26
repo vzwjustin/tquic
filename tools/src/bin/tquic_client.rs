@@ -68,6 +68,7 @@ use tquic::TlsConfig;
 use tquic::TransportHandler;
 use tquic_tools::ApplicationProto;
 use tquic_tools::CertCompressionAlgorithmArg;
+use tquic_tools::discover_global_ip_addrs;
 use tquic_tools::QuicSocket;
 use tquic_tools::Result;
 
@@ -1604,13 +1605,50 @@ fn process_connect_address(option: &mut ClientOpt) {
     }
 }
 
-fn validate_path_options(option: &ClientOpt) -> std::result::Result<(), clap::error::Error> {
+fn maybe_populate_local_addresses(option: &mut ClientOpt) -> Result<()> {
+    if !option.bond || !option.local_addresses.is_empty() {
+        return Ok(());
+    }
+
+    let remote = option
+        .connect_to
+        .ok_or_else(|| "missing connect address".to_string())?;
+    let candidates = discover_global_ip_addrs()?;
+    let mut addresses: Vec<IpAddr> = candidates
+        .into_iter()
+        .filter(|addr| addr.is_ipv4() == remote.is_ipv4())
+        .collect();
+    if addresses.is_empty() {
+        warn!(
+            "bonding enabled but no usable {} addresses discovered",
+            if remote.is_ipv4() { "IPv4" } else { "IPv6" }
+        );
+        return Ok(());
+    }
+
+    addresses.sort();
+    addresses.dedup();
+    info!(
+        "bonding auto-selected {} local address(es)",
+        addresses.len()
+    );
+    option.local_addresses = addresses;
+    Ok(())
+}
+
+fn validate_path_options(
+    option: &ClientOpt,
+    allow_empty_local: bool,
+) -> std::result::Result<(), clap::error::Error> {
     if option.remote_addresses.is_empty() {
         return Ok(());
     }
 
     let extra_local_count = option.local_addresses.len().saturating_sub(1);
     if extra_local_count == 0 {
+        if allow_empty_local {
+            return Ok(());
+        }
         return Err(ClientOpt::command().error(
             ErrorKind::InvalidValue,
             "remote-addresses requires at least two local addresses",
@@ -1678,7 +1716,7 @@ fn parse_option() -> std::result::Result<ClientOpt, clap::error::Error> {
         ));
     }
 
-    validate_path_options(&option)?;
+    validate_path_options(&option, option.bond)?;
 
     if option.max_requests_per_conn != 0 {
         option.max_requests_per_conn = max(option.max_requests_per_conn, option.urls.len() as u64);
@@ -1715,6 +1753,8 @@ fn process_option(option: &mut ClientOpt) -> Result<()> {
 
     process_connect_address(option);
     apply_bonding(option);
+    maybe_populate_local_addresses(option)?;
+    validate_path_options(option, false)?;
     warn_multipath_setup(option);
     Ok(())
 }

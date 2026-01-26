@@ -48,6 +48,7 @@ use tquic::TlsConfig;
 use tquic::TransportHandler;
 use tquic_tools::ApplicationProto;
 use tquic_tools::CertCompressionAlgorithmArg;
+use tquic_tools::discover_global_ip_addrs;
 use tquic_tools::QuicSocket;
 use tquic_tools::Result;
 
@@ -419,6 +420,44 @@ fn convert_address_token_key(key: &str) -> [u8; 16] {
     let mut token_key = [0_u8; 16];
     token_key.copy_from_slice(&key_data[..]);
     token_key
+}
+
+fn normalize_listen_addrs(option: &mut ServerOpt) {
+    option.listen_addrs.retain(|addr| *addr != option.listen);
+    option.listen_addrs.sort();
+    option.listen_addrs.dedup();
+
+    if option.listen.ip().is_unspecified() && !option.listen_addrs.is_empty() {
+        option.listen = option.listen_addrs.remove(0);
+    }
+}
+
+fn maybe_populate_listen_addrs(option: &mut ServerOpt) -> Result<()> {
+    if !option.bond || !option.listen_addrs.is_empty() || !option.listen.ip().is_unspecified() {
+        return Ok(());
+    }
+
+    let port = option.listen.port();
+    let family_ipv4 = option.listen.is_ipv4();
+    let mut addresses: Vec<SocketAddr> = discover_global_ip_addrs()?
+        .into_iter()
+        .filter(|addr| addr.is_ipv4() == family_ipv4)
+        .map(|addr| SocketAddr::new(addr, port))
+        .collect();
+    addresses.sort();
+    addresses.dedup();
+
+    if addresses.is_empty() {
+        warn!(
+            "bonding enabled but no usable {} addresses discovered; using wildcard listen",
+            if family_ipv4 { "IPv4" } else { "IPv6" }
+        );
+        return Ok(());
+    }
+
+    option.listen = addresses[0];
+    option.listen_addrs = addresses[1..].to_vec();
+    Ok(())
 }
 
 fn apply_bonding(option: &mut ServerOpt) {
@@ -1170,6 +1209,8 @@ fn process_option(option: &mut ServerOpt) -> Result<()> {
     }
 
     apply_bonding(option);
+    maybe_populate_listen_addrs(option)?;
+    normalize_listen_addrs(option);
     warn_multipath_setup(option);
     Ok(())
 }
