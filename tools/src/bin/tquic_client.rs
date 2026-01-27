@@ -349,9 +349,16 @@ pub struct ClientOpt {
     /// The range of the request, like "0-1023".
     #[clap(long, value_name = "RANGE", help_heading = "Protocol")]
     pub range: Option<String>,
+
+    /// Custom request headers. Can be specified multiple times. Format: "Name: Value"
+    #[clap(short = 'H', long = "header", value_name = "HEADER", help_heading = "Protocol")]
+    pub headers: Vec<String>,
 }
 
 const MAX_BUF_SIZE: usize = 65536;
+
+/// Number of messages to receive in a single recvmmsg call.
+const RECV_BATCH_SIZE: usize = 32;
 
 /// Multi-threads QUIC client.
 struct Client {
@@ -526,8 +533,8 @@ struct Worker {
     /// Request senders.
     senders: Rc<RefCell<FxHashMap<u64, RequestSender>>>,
 
-    /// Packet read buffer.
-    recv_buf: Vec<u8>,
+    /// Packet read buffers for batch receiving (used by recvmmsg on Linux).
+    recv_bufs: Vec<Vec<u8>>,
 
     /// Worker start time.
     start_time: Instant,
@@ -637,7 +644,7 @@ impl Worker {
             worker_ctx,
             client_ctx,
             senders,
-            recv_buf: vec![0u8; MAX_BUF_SIZE],
+            recv_bufs: (0..RECV_BATCH_SIZE).map(|_| vec![0u8; MAX_BUF_SIZE]).collect(),
             start_time: Instant::now(),
             end_time: None,
             terminated,
@@ -781,13 +788,18 @@ impl Worker {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn process_read_event(&mut self, event: &Event) -> Result<()> {
         loop {
-            // Read datagram from the socket.
-            // TODO: support recvmmsg
-            let (len, local, remote) = match self.sock.recv_from(&mut self.recv_buf, event.token())
-            {
-                Ok(v) => v,
+            // Read multiple datagrams from the socket using recvmmsg.
+            let mut iovecs: Vec<std::io::IoSliceMut<'_>> = self
+                .recv_bufs
+                .iter_mut()
+                .map(|buf| std::io::IoSliceMut::new(buf))
+                .collect();
+
+            let recv_results = match self.sock.recv_mmsg(&mut iovecs, event.token()) {
+                Ok(results) => results,
                 Err(e) => {
                     if e.kind() == std::io::ErrorKind::WouldBlock {
                         debug!("socket recv would block");
@@ -796,9 +808,58 @@ impl Worker {
                     return Err(format!("socket recv error: {:?}", e).into());
                 }
             };
+
+            if recv_results.is_empty() {
+                break;
+            }
+
+            debug!("socket recv {} packets via recvmmsg", recv_results.len());
+
+            // Process each received packet
+            let recv_time = Instant::now();
+            for (i, (len, local, remote)) in recv_results.into_iter().enumerate() {
+                debug!("socket recv {} bytes from {:?}", len, remote);
+
+                let pkt_buf = &mut self.recv_bufs[i][..len];
+                let pkt_info = PacketInfo {
+                    src: remote,
+                    dst: local,
+                    time: recv_time,
+                };
+
+                // Process the incoming packet.
+                match self.endpoint.recv(pkt_buf, &pkt_info) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        error!("recv failed: {:?}", e);
+                        continue;
+                    }
+                };
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn process_read_event(&mut self, event: &Event) -> Result<()> {
+        loop {
+            // Read datagram from the socket.
+            // On non-Linux platforms, use recv_from (recvmmsg is not available).
+            let (len, local, remote) =
+                match self.sock.recv_from(&mut self.recv_bufs[0], event.token()) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if e.kind() == std::io::ErrorKind::WouldBlock {
+                            debug!("socket recv would block");
+                            break;
+                        }
+                        return Err(format!("socket recv error: {:?}", e).into());
+                    }
+                };
             debug!("socket recv {} bytes from {:?}", len, remote);
 
-            let pkt_buf = &mut self.recv_buf[..len];
+            let pkt_buf = &mut self.recv_bufs[0][..len];
             let pkt_info = PacketInfo {
                 src: remote,
                 dst: local,
@@ -921,13 +982,13 @@ impl Request {
         }
     }
 
-    // TODO: support custom headers.
     fn new(
         method: &str,
         url: &Url,
         body: &Option<Vec<u8>>,
         dump_dir: &Option<String>,
         range: &Option<String>,
+        custom_headers: &[String],
     ) -> Self {
         let authority = match url.port() {
             Some(port) => format!("{}:{}", url.host_str().unwrap(), port),
@@ -952,6 +1013,15 @@ impl Request {
                 b"content-length",
                 body.as_ref().unwrap().len().to_string().as_bytes(),
             ));
+        }
+        // Add custom headers
+        for header_str in custom_headers {
+            if let Some((name, value)) = header_str.split_once(':') {
+                headers.push(tquic::h3::Header::new(
+                    name.trim().as_bytes(),
+                    value.trim().as_bytes(),
+                ));
+            }
         }
         Self {
             url: url.clone(),
@@ -1070,8 +1140,14 @@ impl RequestSender {
 
     fn send_request(&mut self, conn: &mut Connection) -> Result<()> {
         let url = &self.option.urls[self.current_url_idx];
-        let mut request =
-            Request::new("GET", url, &None, &self.option.dump_dir, &self.option.range);
+        let mut request = Request::new(
+            "GET",
+            url,
+            &None,
+            &self.option.dump_dir,
+            &self.option.range,
+            &self.option.headers,
+        );
         debug!(
             "{} send request {} current index {}",
             conn.trace_id(),

@@ -29,6 +29,9 @@ use mio::Token;
 use rustc_hash::FxHashMap;
 use slab::Slab;
 
+#[cfg(target_os = "linux")]
+use std::os::unix::io::AsRawFd;
+
 use tquic::CertCompressionAlgorithm;
 use tquic::PacketInfo;
 use tquic::PacketSendHandler;
@@ -149,6 +152,31 @@ impl ValueEnum for ApplicationProto {
     }
 }
 
+/// Convert a libc sockaddr_storage to a Rust SocketAddr (Linux only).
+#[cfg(target_os = "linux")]
+fn sockaddr_to_socketaddr(storage: &libc::sockaddr_storage) -> std::io::Result<SocketAddr> {
+    match storage.ss_family as libc::c_int {
+        libc::AF_INET => {
+            // SAFETY: We checked that the family is AF_INET
+            let addr: &libc::sockaddr_in = unsafe { &*(storage as *const _ as *const _) };
+            let ip = std::net::Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
+            let port = u16::from_be(addr.sin_port);
+            Ok(SocketAddr::from((ip, port)))
+        }
+        libc::AF_INET6 => {
+            // SAFETY: We checked that the family is AF_INET6
+            let addr: &libc::sockaddr_in6 = unsafe { &*(storage as *const _ as *const _) };
+            let ip = std::net::Ipv6Addr::from(addr.sin6_addr.s6_addr);
+            let port = u16::from_be(addr.sin6_port);
+            Ok(SocketAddr::from((ip, port)))
+        }
+        _ => Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "unknown address family",
+        )),
+    }
+}
+
 /// UDP socket wrapper for QUIC
 pub struct QuicSocket {
     /// The underlying UDP sockets for QUIC Endpoint.
@@ -230,6 +258,78 @@ impl QuicSocket {
             Ok((len, remote)) => Ok((len, socket.local_addr()?, remote)),
             Err(e) => Err(e),
         }
+    }
+
+    /// Receive multiple datagrams from the socket using recvmmsg (Linux only).
+    /// Returns a vector of (length, local_addr, remote_addr) tuples for each received packet.
+    /// The packet data is stored in the corresponding buffer slice.
+    #[cfg(target_os = "linux")]
+    pub fn recv_mmsg(
+        &self,
+        bufs: &mut [std::io::IoSliceMut<'_>],
+        token: mio::Token,
+    ) -> std::io::Result<Vec<(usize, SocketAddr, SocketAddr)>> {
+        let socket = match self.socks.get(token.0) {
+            Some(socket) => socket,
+            None => return Err(std::io::Error::new(ErrorKind::Other, "invalid token")),
+        };
+
+        let local_addr = socket.local_addr()?;
+        let fd = socket.as_raw_fd();
+        let num_msgs = bufs.len();
+
+        // Prepare sockaddr storage for each message
+        let mut addrs: Vec<libc::sockaddr_storage> =
+            vec![unsafe { std::mem::zeroed() }; num_msgs];
+        let mut iovecs: Vec<libc::iovec> = bufs
+            .iter_mut()
+            .map(|buf| libc::iovec {
+                iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+                iov_len: buf.len(),
+            })
+            .collect();
+
+        // Prepare mmsghdr structures
+        let mut msgvec: Vec<libc::mmsghdr> = (0..num_msgs)
+            .map(|i| libc::mmsghdr {
+                msg_hdr: libc::msghdr {
+                    msg_name: &mut addrs[i] as *mut _ as *mut libc::c_void,
+                    msg_namelen: std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
+                    msg_iov: &mut iovecs[i],
+                    msg_iovlen: 1,
+                    msg_control: std::ptr::null_mut(),
+                    msg_controllen: 0,
+                    msg_flags: 0,
+                },
+                msg_len: 0,
+            })
+            .collect();
+
+        // Call recvmmsg
+        let ret = unsafe {
+            libc::recvmmsg(
+                fd,
+                msgvec.as_mut_ptr(),
+                num_msgs as libc::c_uint,
+                libc::MSG_DONTWAIT,
+                std::ptr::null_mut(),
+            )
+        };
+
+        if ret < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let num_received = ret as usize;
+        let mut results = Vec::with_capacity(num_received);
+
+        for i in 0..num_received {
+            let len = msgvec[i].msg_len as usize;
+            let remote = sockaddr_to_socketaddr(&addrs[i])?;
+            results.push((len, local_addr, remote));
+        }
+
+        Ok(results)
     }
 
     /// Send data on the socket to the given address.
