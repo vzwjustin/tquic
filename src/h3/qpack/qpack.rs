@@ -18,6 +18,7 @@ use log::trace;
 
 use crate::codec::Decoder;
 use crate::codec::Encoder;
+use crate::h3::qpack::dynamic_table::DynamicTable;
 use crate::h3::qpack::prefix_int::*;
 use crate::h3::qpack::static_table::*;
 use crate::h3::Header;
@@ -131,12 +132,40 @@ impl Representation {
 }
 
 /// A QPACK encoder.
-#[derive(Default)]
-pub struct QpackEncoder {}
+pub struct QpackEncoder {
+    /// The dynamic table used for encoding.
+    dynamic_table: DynamicTable,
+}
+
+impl Default for QpackEncoder {
+    fn default() -> Self {
+        QpackEncoder {
+            dynamic_table: DynamicTable::new(),
+        }
+    }
+}
 
 impl QpackEncoder {
+    /// Create a new QPACK encoder.
     pub fn new() -> QpackEncoder {
         QpackEncoder::default()
+    }
+
+    /// Create a new QPACK encoder with the specified dynamic table capacity.
+    pub fn with_capacity(capacity: usize) -> QpackEncoder {
+        QpackEncoder {
+            dynamic_table: DynamicTable::with_capacity(capacity),
+        }
+    }
+
+    /// Set the dynamic table capacity.
+    pub fn set_capacity(&mut self, capacity: usize) {
+        self.dynamic_table.set_capacity(capacity);
+    }
+
+    /// Get the current insert count of the dynamic table.
+    pub fn insert_count(&self) -> u64 {
+        self.dynamic_table.insert_count()
     }
 
     /// Encode a list of headers into a QPACK field section.
@@ -208,12 +237,40 @@ impl QpackEncoder {
 }
 
 /// A QPACK decoder.
-#[derive(Default)]
-pub struct QpackDecoder {}
+pub struct QpackDecoder {
+    /// The dynamic table used for decoding.
+    dynamic_table: DynamicTable,
+}
+
+impl Default for QpackDecoder {
+    fn default() -> Self {
+        QpackDecoder {
+            dynamic_table: DynamicTable::new(),
+        }
+    }
+}
 
 impl QpackDecoder {
+    /// Create a new QPACK decoder.
     pub fn new() -> QpackDecoder {
         QpackDecoder::default()
+    }
+
+    /// Create a new QPACK decoder with the specified dynamic table capacity.
+    pub fn with_capacity(capacity: usize) -> QpackDecoder {
+        QpackDecoder {
+            dynamic_table: DynamicTable::with_capacity(capacity),
+        }
+    }
+
+    /// Set the dynamic table capacity.
+    pub fn set_capacity(&mut self, capacity: usize) {
+        self.dynamic_table.set_capacity(capacity);
+    }
+
+    /// Get the current insert count of the dynamic table.
+    pub fn insert_count(&self) -> u64 {
+        self.dynamic_table.insert_count()
     }
 
     /// Decode a QPACK header block into a list of headers.
@@ -224,8 +281,25 @@ impl QpackDecoder {
 
         let (req_insert_count, off) = decode_int(buf, 8)?;
         buf = &buf[off..];
-        let (base, off) = decode_int(buf, 7)?;
+
+        // Decode base delta per RFC 9204 Section 4.5.1.
+        // The sign bit (0x80) determines if it's positive or negative delta.
+        let sign_bit = buf[0] & 0x80 != 0;
+        let (delta_base, off) = decode_int(buf, 7)?;
         buf = &buf[off..];
+
+        // Calculate actual base from required insert count and delta.
+        let base = if sign_bit {
+            // Negative delta: Base = Required Insert Count - Delta Base - 1
+            if delta_base + 1 > req_insert_count {
+                return Err(Http3Error::QpackDecompressionFailed);
+            }
+            req_insert_count - delta_base - 1
+        } else {
+            // Positive delta: Base = Required Insert Count + Delta Base
+            req_insert_count + delta_base
+        };
+
         trace!(
             "QpackDecoder Header count={} base={}",
             req_insert_count,
@@ -242,23 +316,39 @@ impl QpackDecoder {
                     buf = &buf[off..];
 
                     trace!("QpackDecoder Indexed index={} static={}", index, static_idx);
-                    if !static_idx {
-                        // TODO: implement dynamic table
-                        return Err(Http3Error::QpackDecompressionFailed);
-                    }
 
-                    let (name, value) = decode_static(index)?;
+                    let (name, value) = if static_idx {
+                        let (n, v) = decode_static(index)?;
+                        (n.to_vec(), v.to_vec())
+                    } else {
+                        // Dynamic table: convert relative index to absolute index.
+                        // The base value is encoded in the header prefix.
+                        let absolute_index = self.dynamic_table.relative_to_absolute(index, base)?;
+                        let entry = self.dynamic_table.get(absolute_index)?;
+                        (entry.name.clone(), entry.value.clone())
+                    };
+
                     left = left
                         .checked_sub((name.len() + value.len() + 32) as u64)
                         .ok_or(Http3Error::QpackDecompressionFailed)?;
-                    out.push(Header(name.to_vec(), value.to_vec()));
+                    out.push(Header(name, value));
                 }
 
                 Representation::IndexedWithPostBase => {
-                    let (index, _) = decode_int(buf, 4)?;
+                    let (index, off) = decode_int(buf, 4)?;
+                    buf = &buf[off..];
                     trace!("QpackDecoder Indexed With Post Base index={}", index);
-                    // TODO: implement dynamic table
-                    return Err(Http3Error::QpackDecompressionFailed);
+
+                    // Post-base index always refers to the dynamic table.
+                    let absolute_index = self.dynamic_table.post_base_to_absolute(index, base)?;
+                    let entry = self.dynamic_table.get(absolute_index)?;
+                    let name = entry.name.clone();
+                    let value = entry.value.clone();
+
+                    left = left
+                        .checked_sub((name.len() + value.len() + 32) as u64)
+                        .ok_or(Http3Error::QpackDecompressionFailed)?;
+                    out.push(Header(name, value));
                 }
 
                 Representation::LiteralWithNameRef => {
@@ -275,22 +365,43 @@ impl QpackDecoder {
                         value
                     );
 
-                    if !static_idx {
-                        // TODO: implement dynamic table
-                        return Err(Http3Error::QpackDecompressionFailed);
-                    }
+                    let name = if static_idx {
+                        let (n, _) = decode_static(name_idx)?;
+                        n.to_vec()
+                    } else {
+                        // Dynamic table: convert relative index to absolute index.
+                        let absolute_index =
+                            self.dynamic_table.relative_to_absolute(name_idx, base)?;
+                        let entry = self.dynamic_table.get(absolute_index)?;
+                        entry.name.clone()
+                    };
 
-                    let (name, _) = decode_static(name_idx)?;
                     left = left
                         .checked_sub((name.len() + value.len() + 32) as u64)
                         .ok_or(Http3Error::QpackDecompressionFailed)?;
-                    out.push(Header(name.to_vec(), value));
+                    out.push(Header(name, value));
                 }
 
                 Representation::LiteralWithPostBase => {
-                    trace!("QpackDecoder Literal With Post Base");
-                    // TODO: implement dynamic table
-                    return Err(Http3Error::QpackDecompressionFailed);
+                    let (name_idx, off) = decode_int(buf, 3)?;
+                    buf = &buf[off..];
+                    let (value, off) = self.decode_str(buf)?;
+                    buf = &buf[off..];
+                    trace!(
+                        "QpackDecoder Literal With Post Base name_idx={} value={:?}",
+                        name_idx,
+                        value
+                    );
+
+                    // Post-base name reference always refers to the dynamic table.
+                    let absolute_index = self.dynamic_table.post_base_to_absolute(name_idx, base)?;
+                    let entry = self.dynamic_table.get(absolute_index)?;
+                    let name = entry.name.clone();
+
+                    left = left
+                        .checked_sub((name.len() + value.len() + 32) as u64)
+                        .ok_or(Http3Error::QpackDecompressionFailed)?;
+                    out.push(Header(name, value));
                 }
 
                 Representation::Literal => {
@@ -342,9 +453,120 @@ impl QpackDecoder {
         Ok((val, buf_len - buf.len()))
     }
 
-    /// Process control instructions from the encoder.
-    pub fn process(&mut self, _buf: &mut [u8]) -> Result<()> {
-        // TODO: support instructions
+    /// Process control instructions from the encoder stream.
+    ///
+    /// Encoder instructions are used to modify the dynamic table.
+    /// See RFC 9204 Section 4.3.
+    pub fn process(&mut self, buf: &[u8]) -> Result<()> {
+        let mut buf = buf;
+
+        while !buf.is_empty() {
+            let first = buf[0];
+
+            // Set Dynamic Table Capacity: starts with '001'
+            // 0   1   2   3   4   5   6   7
+            // +---+---+---+---+---+---+---+---+
+            // | 0 | 0 | 1 |   Capacity (5+)   |
+            // +---+---+---+-------------------+
+            if first & 0b1110_0000 == 0b0010_0000 {
+                let (capacity, off) = decode_int(buf, 5)?;
+                buf = &buf[off..];
+                trace!("QpackDecoder SetDynamicTableCapacity capacity={}", capacity);
+                self.dynamic_table.set_capacity(capacity as usize);
+                continue;
+            }
+
+            // Insert With Name Reference: starts with '1'
+            // 0   1   2   3   4   5   6   7
+            // +---+---+---+---+---+---+---+---+
+            // | 1 | T |    Name Index (6+)    |
+            // +---+---+-----------------------+
+            // | H |     Value Length (7+)     |
+            // +---+---------------------------+
+            // |  Value String (Length bytes)  |
+            // +-------------------------------+
+            if first & 0b1000_0000 == 0b1000_0000 {
+                let static_ref = first & 0b0100_0000 == 0b0100_0000;
+                let (name_index, off) = decode_int(buf, 6)?;
+                buf = &buf[off..];
+                let (value, off) = self.decode_str(buf)?;
+                buf = &buf[off..];
+
+                let name = if static_ref {
+                    let (n, _) = decode_static(name_index)?;
+                    n.to_vec()
+                } else {
+                    let entry = self.dynamic_table.get(name_index)?;
+                    entry.name.clone()
+                };
+
+                trace!(
+                    "QpackDecoder InsertWithNameRef static={} name_index={} name={:?} value={:?}",
+                    static_ref,
+                    name_index,
+                    name,
+                    value
+                );
+
+                self.dynamic_table.insert(name, value)?;
+                continue;
+            }
+
+            // Insert With Literal Name: starts with '01'
+            // 0   1   2   3   4   5   6   7
+            // +---+---+---+---+---+---+---+---+
+            // | 0 | 1 | H | Name Length (5+)  |
+            // +---+---+---+-------------------+
+            // |  Name String (Length bytes)   |
+            // +---+---------------------------+
+            // | H |     Value Length (7+)     |
+            // +---+---------------------------+
+            // |  Value String (Length bytes)  |
+            // +-------------------------------+
+            if first & 0b1100_0000 == 0b0100_0000 {
+                let name_huff = first & 0b0010_0000 == 0b0010_0000;
+                let (name_len, off) = decode_int(buf, 5)?;
+                buf = &buf[off..];
+
+                let name_raw = buf.read(name_len as usize)?;
+                let name = if name_huff {
+                    huffman::decode(&name_raw)?
+                } else {
+                    name_raw.to_vec()
+                };
+
+                let (value, off) = self.decode_str(buf)?;
+                buf = &buf[off..];
+
+                trace!(
+                    "QpackDecoder InsertWithLiteralName name={:?} value={:?}",
+                    name,
+                    value
+                );
+
+                self.dynamic_table.insert(name, value)?;
+                continue;
+            }
+
+            // Duplicate: starts with '000'
+            // 0   1   2   3   4   5   6   7
+            // +---+---+---+---+---+---+---+---+
+            // | 0 | 0 | 0 |    Index (5+)     |
+            // +---+---+---+-------------------+
+            if first & 0b1110_0000 == 0b0000_0000 {
+                let (index, off) = decode_int(buf, 5)?;
+                buf = &buf[off..];
+
+                trace!("QpackDecoder Duplicate index={}", index);
+
+                self.dynamic_table.duplicate(index)?;
+                continue;
+            }
+
+            // Unknown instruction - this should not happen.
+            return Err(Http3Error::QpackEncoderStreamError);
+        }
+
         Ok(())
     }
 }
@@ -563,8 +785,91 @@ mod tests {
         let mut dec = QpackDecoder::new();
         assert!(dec.decode(&buf, 1024 * 16).is_err());
     }
+
+    #[test]
+    fn dynamic_table_encoder_instructions() {
+        let mut dec = QpackDecoder::with_capacity(1024);
+
+        // Test: Set Dynamic Table Capacity instruction
+        // 001 + capacity (5-bit prefix)
+        // Capacity = 256 (fits in 5 bits: 0b11111 + continuation)
+        let set_capacity = vec![0b0011_1111, 0b1110_0001, 0b01]; // 001 + 31 + (256-31)
+        dec.process(&set_capacity).unwrap();
+        assert_eq!(dec.dynamic_table.capacity(), 256);
+
+        // Test: Insert With Literal Name instruction
+        // 01 + H=0 + name_len (5-bit prefix) + name + H=0 + value_len (7-bit) + value
+        // name = "custom", value = "test"
+        let insert_literal = vec![
+            0b0100_0110, // 01 + H=0 + name_len=6
+            b'c', b'u', b's', b't', b'o', b'm', // name = "custom"
+            0x04, // H=0 + value_len=4
+            b't', b'e', b's', b't', // value = "test"
+        ];
+        dec.process(&insert_literal).unwrap();
+        assert_eq!(dec.dynamic_table.len(), 1);
+
+        let entry = dec.dynamic_table.get(0).unwrap();
+        assert_eq!(entry.name, b"custom");
+        assert_eq!(entry.value, b"test");
+
+        // Test: Insert With Name Reference (static) instruction
+        // 1 + T=1 + name_index (6-bit prefix) + H=0 + value_len (7-bit) + value
+        // static index 15 = :method, value = "PATCH"
+        let insert_name_ref = vec![
+            0b1100_1111, // 1 + T=1(static) + index=15
+            0x05,        // H=0 + value_len=5
+            b'P', b'A', b'T', b'C', b'H', // value = "PATCH"
+        ];
+        dec.process(&insert_name_ref).unwrap();
+        assert_eq!(dec.dynamic_table.len(), 2);
+
+        let entry = dec.dynamic_table.get(1).unwrap();
+        assert_eq!(entry.name, b":method");
+        assert_eq!(entry.value, b"PATCH");
+
+        // Test: Duplicate instruction
+        // 000 + index (5-bit prefix)
+        // Duplicate entry 0
+        let duplicate = vec![0b0000_0000]; // 000 + index=0
+        dec.process(&duplicate).unwrap();
+        assert_eq!(dec.dynamic_table.len(), 3);
+
+        let entry = dec.dynamic_table.get(2).unwrap();
+        assert_eq!(entry.name, b"custom");
+        assert_eq!(entry.value, b"test");
+    }
+
+    #[test]
+    fn dynamic_table_decode_indexed() {
+        let mut dec = QpackDecoder::with_capacity(1024);
+
+        // First, insert an entry into the dynamic table
+        let insert = vec![
+            0b0100_0110, // Insert with literal name, name_len=6
+            b'c', b'u', b's', b't', b'o', b'm', // name
+            0x05, // value_len=5
+            b'v', b'a', b'l', b'u', b'e', // value
+        ];
+        dec.process(&insert).unwrap();
+
+        // Now decode a field section that references the dynamic table
+        // Required Insert Count = 1, Base = 1 (so relative index 0 = absolute index 0)
+        // Indexed representation with T=0 (dynamic) and relative index 0
+        let field_section = vec![
+            0x01, // Required Insert Count = 1
+            0x00, // Base = 0 (no delta)
+            0b1000_0000, // Indexed, T=0 (dynamic), index=0
+        ];
+
+        let (headers, _) = dec.decode(&field_section, u64::MAX).unwrap();
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].0, b"custom");
+        assert_eq!(headers[0].1, b"value");
+    }
 }
 
+mod dynamic_table;
 mod huffman;
 mod prefix_int;
 mod static_table;

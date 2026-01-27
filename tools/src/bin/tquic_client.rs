@@ -357,6 +357,9 @@ pub struct ClientOpt {
 
 const MAX_BUF_SIZE: usize = 65536;
 
+/// Number of messages to receive in a single recvmmsg call.
+const RECV_BATCH_SIZE: usize = 32;
+
 /// Multi-threads QUIC client.
 struct Client {
     /// Client option.
@@ -530,8 +533,8 @@ struct Worker {
     /// Request senders.
     senders: Rc<RefCell<FxHashMap<u64, RequestSender>>>,
 
-    /// Packet read buffer.
-    recv_buf: Vec<u8>,
+    /// Packet read buffers for batch receiving (used by recvmmsg on Linux).
+    recv_bufs: Vec<Vec<u8>>,
 
     /// Worker start time.
     start_time: Instant,
@@ -641,7 +644,7 @@ impl Worker {
             worker_ctx,
             client_ctx,
             senders,
-            recv_buf: vec![0u8; MAX_BUF_SIZE],
+            recv_bufs: (0..RECV_BATCH_SIZE).map(|_| vec![0u8; MAX_BUF_SIZE]).collect(),
             start_time: Instant::now(),
             end_time: None,
             terminated,
@@ -785,13 +788,18 @@ impl Worker {
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn process_read_event(&mut self, event: &Event) -> Result<()> {
         loop {
-            // Read datagram from the socket.
-            // TODO: support recvmmsg
-            let (len, local, remote) = match self.sock.recv_from(&mut self.recv_buf, event.token())
-            {
-                Ok(v) => v,
+            // Read multiple datagrams from the socket using recvmmsg.
+            let mut iovecs: Vec<std::io::IoSliceMut<'_>> = self
+                .recv_bufs
+                .iter_mut()
+                .map(|buf| std::io::IoSliceMut::new(buf))
+                .collect();
+
+            let recv_results = match self.sock.recv_mmsg(&mut iovecs, event.token()) {
+                Ok(results) => results,
                 Err(e) => {
                     if e.kind() == std::io::ErrorKind::WouldBlock {
                         debug!("socket recv would block");
@@ -800,9 +808,58 @@ impl Worker {
                     return Err(format!("socket recv error: {:?}", e).into());
                 }
             };
+
+            if recv_results.is_empty() {
+                break;
+            }
+
+            debug!("socket recv {} packets via recvmmsg", recv_results.len());
+
+            // Process each received packet
+            let recv_time = Instant::now();
+            for (i, (len, local, remote)) in recv_results.into_iter().enumerate() {
+                debug!("socket recv {} bytes from {:?}", len, remote);
+
+                let pkt_buf = &mut self.recv_bufs[i][..len];
+                let pkt_info = PacketInfo {
+                    src: remote,
+                    dst: local,
+                    time: recv_time,
+                };
+
+                // Process the incoming packet.
+                match self.endpoint.recv(pkt_buf, &pkt_info) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        error!("recv failed: {:?}", e);
+                        continue;
+                    }
+                };
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn process_read_event(&mut self, event: &Event) -> Result<()> {
+        loop {
+            // Read datagram from the socket.
+            // On non-Linux platforms, use recv_from (recvmmsg is not available).
+            let (len, local, remote) =
+                match self.sock.recv_from(&mut self.recv_bufs[0], event.token()) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if e.kind() == std::io::ErrorKind::WouldBlock {
+                            debug!("socket recv would block");
+                            break;
+                        }
+                        return Err(format!("socket recv error: {:?}", e).into());
+                    }
+                };
             debug!("socket recv {} bytes from {:?}", len, remote);
 
-            let pkt_buf = &mut self.recv_buf[..len];
+            let pkt_buf = &mut self.recv_bufs[0][..len];
             let pkt_info = PacketInfo {
                 src: remote,
                 dst: local,

@@ -25,6 +25,7 @@ signal-hook = "0.3.17"
 md5 = "0.7"
 tquic = { path = "..", version = "1.5.0"}
 get_if_addrs = "0.5.3"
+libc = "0.2"
 
 [target."cfg(unix)".dependencies]
 jemallocator = { version = "0.5", package = "tikv-jemallocator" }
