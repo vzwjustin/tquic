@@ -349,6 +349,10 @@ pub struct ClientOpt {
     /// The range of the request, like "0-1023".
     #[clap(long, value_name = "RANGE", help_heading = "Protocol")]
     pub range: Option<String>,
+
+    /// Custom request headers. Can be specified multiple times. Format: "Name: Value"
+    #[clap(short = 'H', long = "header", value_name = "HEADER", help_heading = "Protocol")]
+    pub headers: Vec<String>,
 }
 
 const MAX_BUF_SIZE: usize = 65536;
@@ -921,13 +925,13 @@ impl Request {
         }
     }
 
-    // TODO: support custom headers.
     fn new(
         method: &str,
         url: &Url,
         body: &Option<Vec<u8>>,
         dump_dir: &Option<String>,
         range: &Option<String>,
+        custom_headers: &[String],
     ) -> Self {
         let authority = match url.port() {
             Some(port) => format!("{}:{}", url.host_str().unwrap(), port),
@@ -952,6 +956,15 @@ impl Request {
                 b"content-length",
                 body.as_ref().unwrap().len().to_string().as_bytes(),
             ));
+        }
+        // Add custom headers
+        for header_str in custom_headers {
+            if let Some((name, value)) = header_str.split_once(':') {
+                headers.push(tquic::h3::Header::new(
+                    name.trim().as_bytes(),
+                    value.trim().as_bytes(),
+                ));
+            }
         }
         Self {
             url: url.clone(),
@@ -1070,8 +1083,14 @@ impl RequestSender {
 
     fn send_request(&mut self, conn: &mut Connection) -> Result<()> {
         let url = &self.option.urls[self.current_url_idx];
-        let mut request =
-            Request::new("GET", url, &None, &self.option.dump_dir, &self.option.range);
+        let mut request = Request::new(
+            "GET",
+            url,
+            &None,
+            &self.option.dump_dir,
+            &self.option.range,
+            &self.option.headers,
+        );
         debug!(
             "{} send request {} current index {}",
             conn.trace_id(),
